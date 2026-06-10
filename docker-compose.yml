@@ -1,0 +1,7 @@
+services:
+  anirena-torznab:
+    build: .
+    container_name: anirena-torznab
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
