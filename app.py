@@ -6,15 +6,16 @@ Add to Prowlarr as a Torznab indexer:
   API Key: (leave blank or any value)
 """
 
+import hashlib
 import re
+import threading
 import time
 import logging
-from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from xml.etree import ElementTree as ET
 
 import requests
-from urllib.parse import urlencode, quote
+from urllib.parse import quote
 from flask import Flask, request, Response
 
 app = Flask(__name__)
@@ -25,9 +26,7 @@ ANIRENA_RSS = "https://www.anirena.com/rss?adult=1"
 INDEXER_TITLE = "AniRena"
 INDEXER_URL = "https://www.anirena.com"
 
-# Prowlarr/Torznab anime category
 ANIME_CATEGORY_ID = 5070
-ANIME_CATEGORY_NAME = "Anime"
 
 FETCH_HEADERS = {
     "User-Agent": (
@@ -38,9 +37,67 @@ FETCH_HEADERS = {
     "Accept": "application/rss+xml, application/xml, text/xml, */*",
 }
 
+_session = requests.Session()
+_infohash_cache: dict[str, str] = {}
+
 # Simple in-memory cache: (timestamp, parsed_items)
 _cache: tuple[float, list[dict]] | None = None
 CACHE_TTL = 300  # seconds
+
+
+def _bencode_end(data: bytes, pos: int) -> int:
+    c = data[pos]
+    if c == ord('i'):
+        return data.index(ord('e'), pos + 1) + 1
+    elif c == ord('l'):
+        pos += 1
+        while data[pos] != ord('e'):
+            pos = _bencode_end(data, pos)
+        return pos + 1
+    elif c == ord('d'):
+        pos += 1
+        while data[pos] != ord('e'):
+            pos = _bencode_end(data, pos)
+            pos = _bencode_end(data, pos)
+        return pos + 1
+    else:
+        colon = data.index(ord(':'), pos)
+        return colon + 1 + int(data[pos:colon])
+
+
+def _extract_infohash(torrent_bytes: bytes) -> str | None:
+    try:
+        idx = torrent_bytes.find(b'4:info')
+        if idx < 0:
+            return None
+        start = idx + 6
+        end = _bencode_end(torrent_bytes, start)
+        return hashlib.sha1(torrent_bytes[start:end]).hexdigest().upper()
+    except Exception:
+        return None
+
+
+def _prefetch_infohashes(items: list[dict]) -> None:
+    new = [i for i in items
+           if i.get("torrent_url")
+           and i["torrent_url"].startswith("https://www.anirena.com/")
+           and i["torrent_url"] not in _infohash_cache][:10]
+    for idx, item in enumerate(new):
+        if idx > 0:
+            time.sleep(5)
+        try:
+            resp = _session.get(
+                item["torrent_url"],
+                headers={**FETCH_HEADERS, "Referer": "https://www.anirena.com/"},
+                timeout=20,
+            )
+            resp.raise_for_status()
+            ih = _extract_infohash(resp.content)
+            if ih:
+                _infohash_cache[item["torrent_url"]] = ih
+                log.info("Infohash cached for %s: %s", item["title"], ih)
+        except Exception as exc:
+            log.warning("Prefetch failed for %s: %s", item["title"], exc)
 
 
 def fetch_anirena_items() -> list[dict]:
@@ -51,7 +108,7 @@ def fetch_anirena_items() -> list[dict]:
 
     log.info("Fetching AniRena RSS …")
     try:
-        resp = requests.get(ANIRENA_RSS, headers=FETCH_HEADERS, timeout=15)
+        resp = _session.get(ANIRENA_RSS, headers=FETCH_HEADERS, timeout=15)
         resp.raise_for_status()
     except Exception as exc:
         log.error("Failed to fetch AniRena RSS: %s", exc)
@@ -59,6 +116,7 @@ def fetch_anirena_items() -> list[dict]:
 
     items = parse_rss(resp.content)
     _cache = (now, items)
+    threading.Thread(target=_prefetch_infohashes, args=(items,), daemon=True).start()
     return items
 
 
@@ -69,7 +127,6 @@ def parse_rss(content: bytes) -> list[dict]:
         log.error("XML parse error: %s", exc)
         return []
 
-    ns = {"content": "http://purl.org/rss/1.0/modules/content/"}
     channel = root.find("channel")
     if channel is None:
         return []
@@ -91,7 +148,6 @@ def parse_rss(content: bytes) -> list[dict]:
             except ValueError:
                 size = 0
 
-        # Parse pubDate to a UTC timestamp for sorting
         pub_ts = 0
         if pub_date:
             try:
@@ -131,7 +187,6 @@ def matches_query(item: dict, query: str) -> bool:
 
 
 def proxy_torrent_url(torrent_url: str) -> str:
-    """Rewrite an AniRena torrent URL to go through our download proxy."""
     if not torrent_url:
         return torrent_url
     return f"{request.host_url}download?url={quote(torrent_url, safe='')}"
@@ -177,7 +232,6 @@ def build_torznab_feed(items: list[dict], query: str = "") -> str:
                     "type": "application/x-bittorrent",
                 },
             )
-        # Torznab attributes
         ET.SubElement(
             el,
             f"{{{TORZNAB_NS}}}attr",
@@ -188,6 +242,13 @@ def build_torznab_feed(items: list[dict], query: str = "") -> str:
                 el,
                 f"{{{TORZNAB_NS}}}attr",
                 {"name": "size", "value": str(item["size"])},
+            )
+        ih = _infohash_cache.get(item["torrent_url"])
+        if ih:
+            ET.SubElement(
+                el,
+                f"{{{TORZNAB_NS}}}attr",
+                {"name": "infohash", "value": ih},
             )
 
     raw = ET.tostring(rss, encoding="unicode")
@@ -224,14 +285,13 @@ def build_caps_xml() -> str:
 
 @app.route("/download", methods=["GET"])
 def download():
-    """Proxy torrent file downloads from AniRena with browser-like headers."""
     url = request.args.get("url", "")
     if not url or not url.startswith("https://www.anirena.com/"):
         return Response("Invalid URL", status=400)
 
     log.info("Proxying torrent download: %s", url)
     try:
-        resp = requests.get(
+        resp = _session.get(
             url,
             headers={**FETCH_HEADERS, "Referer": "https://www.anirena.com/"},
             timeout=30,
