@@ -190,8 +190,10 @@ def build_torznab_feed(items: list[dict], query: str = "") -> str:
                 {"name": "size", "value": str(item["size"])},
             )
 
-    return '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(
-        rss, encoding="unicode"
+    raw = ET.tostring(rss, encoding="unicode")
+    from xml.dom.minidom import parseString
+    return parseString(raw).toprettyxml(indent="  ", encoding=None).replace(
+        '<?xml version="1.0" ?>', '<?xml version="1.0" encoding="UTF-8"?>'
     )
 
 
@@ -264,7 +266,6 @@ def api():
         feed = build_torznab_feed(items, query=q)
         return Response(feed, content_type="application/rss+xml; charset=utf-8")
 
-    # Unknown function
     return Response(
         '<?xml version="1.0"?><error code="202" description="No such function"/>',
         status=400,
