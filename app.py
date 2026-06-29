@@ -75,7 +75,7 @@ def _prefetch_infohashes(items: list[dict]) -> None:
                 _infohash_cache[item["torrent_url"]] = ih
                 log.info("Infohash cached for %s: %s", item["title"], ih)
             else:
-                log.warning("No btih in /magnet response for %s: %r", item["title"], text[:200])
+                log.warning("No btih in /magnet response for %s: %r", item["title"], magnet[:200])
         except Exception as exc:
             log.warning("Prefetch failed for %s: %s", item["title"], exc)
 
@@ -269,6 +269,12 @@ def download():
     if not url or not url.startswith("https://www.anirena.com/"):
         return Response("Invalid URL", status=400)
 
+    # If we already know the infohash, redirect to a magnet link — no upstream fetch needed.
+    ih = _infohash_cache.get(url)
+    if ih:
+        log.info("Returning cached magnet for %s", url)
+        return Response(status=302, headers={"Location": f"magnet:?xt=urn:btih:{ih}"})
+
     log.info("Proxying torrent download: %s", url)
     try:
         resp = _session.get(
@@ -277,10 +283,17 @@ def download():
             timeout=30,
             stream=True,
         )
-        resp.raise_for_status()
     except Exception as exc:
         log.error("Torrent download failed: %s", exc)
         return Response(f"Failed to fetch torrent: {exc}", status=502)
+
+    if resp.status_code == 429:
+        log.warning("Rate limited by anirena.com on download: %s", url)
+        return Response("Rate limited by upstream", status=429)
+
+    if not resp.ok:
+        log.error("Torrent download failed: HTTP %s for %s", resp.status_code, url)
+        return Response(f"Upstream returned {resp.status_code}", status=502)
 
     return Response(
         resp.iter_content(chunk_size=8192),
