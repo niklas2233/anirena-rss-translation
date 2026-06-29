@@ -6,7 +6,6 @@ Add to Prowlarr as a Torznab indexer:
   API Key: (leave blank or any value)
 """
 
-import hashlib
 import re
 import threading
 import time
@@ -45,57 +44,38 @@ _cache: tuple[float, list[dict]] | None = None
 CACHE_TTL = 300  # seconds
 
 
-def _bencode_end(data: bytes, pos: int) -> int:
-    c = data[pos]
-    if c == ord('i'):
-        return data.index(ord('e'), pos + 1) + 1
-    elif c == ord('l'):
-        pos += 1
-        while data[pos] != ord('e'):
-            pos = _bencode_end(data, pos)
-        return pos + 1
-    elif c == ord('d'):
-        pos += 1
-        while data[pos] != ord('e'):
-            pos = _bencode_end(data, pos)
-            pos = _bencode_end(data, pos)
-        return pos + 1
-    else:
-        colon = data.index(ord(':'), pos)
-        return colon + 1 + int(data[pos:colon])
 
-
-def _extract_infohash(torrent_bytes: bytes) -> str | None:
-    try:
-        idx = torrent_bytes.find(b'4:info')
-        if idx < 0:
-            return None
-        start = idx + 6
-        end = _bencode_end(torrent_bytes, start)
-        return hashlib.sha1(torrent_bytes[start:end]).hexdigest().upper()
-    except Exception:
-        return None
+def _magnet_url(item: dict) -> str | None:
+    """Return the /magnet endpoint URL derived from the torrent page GUID."""
+    guid = item.get("guid", "")
+    if guid.startswith("https://www.anirena.com/torrents/"):
+        return guid.rstrip("/") + "/magnet"
+    return None
 
 
 def _prefetch_infohashes(items: list[dict]) -> None:
     new = [i for i in items
-           if i.get("torrent_url")
-           and i["torrent_url"].startswith("https://www.anirena.com/")
-           and i["torrent_url"] not in _infohash_cache][:10]
+           if _magnet_url(i) and i["torrent_url"] not in _infohash_cache][:20]
     for idx, item in enumerate(new):
         if idx > 0:
-            time.sleep(5)
+            time.sleep(1.5)
+        url = _magnet_url(item)
         try:
             resp = _session.get(
-                item["torrent_url"],
+                url,
                 headers={**FETCH_HEADERS, "Referer": "https://www.anirena.com/"},
                 timeout=20,
+                allow_redirects=False,
             )
-            resp.raise_for_status()
-            ih = _extract_infohash(resp.content)
-            if ih:
+            # Server redirects to a magnet: URI — grab it from Location header
+            magnet = resp.headers.get("Location", "") or resp.text.strip()
+            m = re.search(r'btih:([0-9a-fA-F]{40})', magnet, re.IGNORECASE)
+            if m:
+                ih = m.group(1).upper()
                 _infohash_cache[item["torrent_url"]] = ih
                 log.info("Infohash cached for %s: %s", item["title"], ih)
+            else:
+                log.warning("No btih in /magnet response for %s: %r", item["title"], text[:200])
         except Exception as exc:
             log.warning("Prefetch failed for %s: %s", item["title"], exc)
 
